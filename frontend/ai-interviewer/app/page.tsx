@@ -1,99 +1,264 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
-import { Mic, MicOff, AudioWaveformIcon as Waveform } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { ChatSidebar } from '@/components/voice-chat/chat-sidebar'
+import { VoiceControl } from '@/components/voice-chat/voice-control'
+import { Message } from '@/components/voice-chat/chat-sidebar'
 
-const DynamicAIIcon = ({ isActive }) => {
-  return (
-    <div className={`w-48 h-48 rounded-full flex items-center justify-center bg-blue-100 dark:bg-blue-900 transition-all duration-300 ${isActive ? 'scale-110' : 'scale-100'}`}>
-      <Waveform className={`w-24 h-24 text-blue-500 dark:text-blue-300 transition-all duration-300 ${isActive ? 'animate-pulse' : ''}`} />
-    </div>
-  )
-}
+const SAMPLE_RATE = 16000
+const NUM_CHANNELS = 1
+declare const protobuf: any
 
 export default function VoiceAIChat() {
-  const [messages, setMessages] = useState([
-    { id: 1, text: "Hello! How can I assist you today?", sender: "ai" },
-    { id: 2, text: "Can you tell me about the weather?", sender: "user" },
-    { id: 3, text: "The weather today is sunny with a high of 75°F (24°C) and a low of 60°F (16°C). It's a perfect day to spend some time outdoors!", sender: "ai" },
+  const [messages, setMessages] = useState<Message[]>([
+    { id: 1, text: "Hello! I'm your AI interviewer. Shall we begin?", sender: "ai" },
   ])
   const [isRecording, setIsRecording] = useState(false)
   const [isAISpeaking, setIsAISpeaking] = useState(false)
-  const [status, setStatus] = useState("Tap to speak")
-  const chatContainerRef = useRef(null)
+  const [status, setStatus] = useState("Loading protobuf...")
+  
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const webSocketRef = useRef<WebSocket | null>(null)
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null)
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const frameRef = useRef<any>(null)
+  const streamRef = useRef<MediaStream | null>(null)
 
-  const toggleRecording = () => {
-    setIsRecording(!isRecording)
-    setStatus(isRecording ? "Tap to speak" : "Listening...")
-    // Simulate AI response after a short delay
-    if (!isRecording) {
-      setTimeout(() => {
-        setIsAISpeaking(true)
-        setStatus("AI is responding...")
+  useEffect(() => {
+    let isCurrentMount = true
+    let scriptElement: HTMLScriptElement | null = null
+
+    const loadProtobuf = async () => {
+      return new Promise<void>((resolve, reject) => {
+        scriptElement = document.createElement('script')
+        scriptElement.src = 'https://cdn.jsdelivr.net/npm/protobufjs@7.X.X/dist/protobuf.min.js'
+        scriptElement.async = true
+        
+        scriptElement.onload = async () => {
+          if (!isCurrentMount) return
+          try {
+            const root = await protobuf.load("/frames.proto")
+            frameRef.current = root.lookupType("pipecat.Frame")
+            setStatus("Connecting to server...")
+            connectWebSocket()
+            resolve()
+          } catch (error) {
+            console.error('Error loading protobuf:', error)
+            setStatus("Error loading protobuf")
+            reject(error)
+          }
+        }
+        
+        scriptElement.onerror = (error) => {
+          console.error('Error loading protobuf script:', error)
+          setStatus("Error loading protobuf")
+          reject(error)
+        }
+        
+        document.body.appendChild(scriptElement)
+      })
+    }
+
+    const connectWebSocket = () => {
+      if (!isCurrentMount) return
+      
+      const ws = new WebSocket('ws://localhost:8765')
+      console.log('Attempting WebSocket connection...')
+      
+      ws.onopen = () => {
+        if (!isCurrentMount) {
+          ws.close()
+          return
+        }
+        console.log('WebSocket connected')
+        setStatus('Ready to begin')
+        webSocketRef.current = ws
+      }
+
+      ws.onmessage = async (event) => {
+        if (!isCurrentMount) return
+        console.log('Received WebSocket message')
+        try {
+          const arrayBuffer = await event.data.arrayBuffer()
+          if (!frameRef.current) return
+
+          const parsedFrame = frameRef.current.decode(new Uint8Array(arrayBuffer))
+          console.log('Parsed frame:', parsedFrame)
+
+          if (parsedFrame.audio && audioContextRef.current) {
+            const audioData = new Uint8Array(parsedFrame.audio.audio)
+            audioContextRef.current.decodeAudioData(
+              audioData.buffer,
+              (buffer) => {
+                if (!isCurrentMount || !audioContextRef.current) return
+                const source = audioContextRef.current.createBufferSource()
+                source.buffer = buffer
+                source.connect(audioContextRef.current.destination)
+                source.start()
+                setIsAISpeaking(true)
+                source.onended = () => {
+                  if (!isCurrentMount) return
+                  setIsAISpeaking(false)
+                  setStatus('Tap to speak')
+                }
+              },
+              (error) => console.error('Audio decoding error:', error)
+            )
+          }
+
+          if (parsedFrame.text) {
+            setMessages(prev => [...prev, { 
+              id: prev.length + 1, 
+              text: parsedFrame.text.text, 
+              sender: "ai" 
+            }])
+          }
+        } catch (error) {
+          console.error('Error handling message:', error)
+        }
+      }
+
+      ws.onerror = (error) => {
+        if (!isCurrentMount) return
+        console.error('WebSocket error:', error)
+        setStatus('Connection error')
+      }
+
+      ws.onclose = () => {
+        if (!isCurrentMount) return
+        console.log('WebSocket closed')
+        setStatus('Connection closed')
+        // Try to reconnect after a delay
         setTimeout(() => {
-          setMessages(prev => [...prev, { id: prev.length + 1, text: "Here's a simulated AI response. How else can I help you?", sender: "ai" }])
-          setIsAISpeaking(false)
-          setStatus("Tap to speak")
+          if (isCurrentMount) {
+            connectWebSocket()
+          }
         }, 3000)
-      }, 2000)
+      }
+    }
+
+    loadProtobuf().catch(console.error)
+
+    return () => {
+      isCurrentMount = false
+      cleanupResources()
+      if (scriptElement && document.body.contains(scriptElement)) {
+        document.body.removeChild(scriptElement)
+      }
+    }
+  }, [])
+
+  const cleanupResources = () => {
+    if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.disconnect()
+      scriptProcessorRef.current = null
+    }
+    if (audioSourceRef.current) {
+      audioSourceRef.current.disconnect()
+      audioSourceRef.current = null
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop())
+      streamRef.current = null
+    }
+    if (webSocketRef.current) {
+      webSocketRef.current.close()
+      webSocketRef.current = null
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close()
+      audioContextRef.current = null
     }
   }
 
-  useEffect(() => {
-    if (chatContainerRef.current) {
-      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight
+  const startRecording = async () => {
+    try {
+      // Create audio context on user interaction
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        audioContextRef.current = new AudioContext({ sampleRate: SAMPLE_RATE })
+      }
+      await audioContextRef.current.resume()
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: SAMPLE_RATE,
+          channelCount: NUM_CHANNELS,
+          autoGainControl: true,
+          echoCancellation: true,
+          noiseSuppression: true,
+        }
+      })
+      
+      streamRef.current = stream
+      const source = audioContextRef.current.createMediaStreamSource(stream)
+      const processor = audioContextRef.current.createScriptProcessor(512, 1, 1)
+      
+      source.connect(processor)
+      processor.connect(audioContextRef.current.destination)
+
+      processor.onaudioprocess = (e) => {
+        if (webSocketRef.current?.readyState === WebSocket.OPEN && frameRef.current) {
+          const audioData = e.inputBuffer.getChannelData(0)
+          const pcmData = new Int16Array(audioData.length)
+          for (let i = 0; i < audioData.length; i++) {
+            const s = Math.max(-1, Math.min(1, audioData[i]))
+            pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
+          }
+          
+          const frame = frameRef.current.create({
+            audio: {
+              audio: Array.from(new Uint8Array(pcmData.buffer)),
+              sampleRate: SAMPLE_RATE,
+              numChannels: NUM_CHANNELS
+            }
+          })
+          const encodedFrame = frameRef.current.encode(frame).finish()
+          webSocketRef.current.send(encodedFrame)
+        }
+      }
+
+      audioSourceRef.current = source
+      scriptProcessorRef.current = processor
+      setIsRecording(true)
+      setStatus('Recording...')
+
+    } catch (error) {
+      console.error('Error starting recording:', error)
+      setStatus('Error accessing microphone')
     }
-  }, [messages])
+  }
+
+  const stopRecording = () => {
+    if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.disconnect()
+    }
+    if (audioSourceRef.current) {
+      audioSourceRef.current.disconnect()
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop())
+    }
+    setIsRecording(false)
+    setStatus('Processing...')
+  }
+
+  const toggleRecording = async () => {
+    if (!isRecording) {
+      await startRecording()
+    } else {
+      stopRecording()
+    }
+  }
 
   return (
     <div className="flex h-screen bg-gray-100 dark:bg-gray-900">
-      <aside className="w-1/3 bg-white dark:bg-gray-800 shadow-lg overflow-hidden flex flex-col">
-        <header className="bg-blue-500 dark:bg-blue-700 p-4">
-          <h1 className="text-2xl font-bold text-white">Voice AI Chat</h1>
-        </header>
-        <div 
-          ref={chatContainerRef}
-          className="flex-grow overflow-y-auto p-4 space-y-4 scrollbar-thin scrollbar-thumb-gray-400 scrollbar-track-gray-200"
-        >
-          {messages.map((message) => (
-            <div
-              key={message.id}
-              className={`flex ${message.sender === 'user' ? 'justify-end' : 'justify-start'}`}
-            >
-              <div
-                className={`max-w-xs sm:max-w-sm md:max-w-md lg:max-w-lg xl:max-w-xl rounded-lg p-3 ${
-                  message.sender === 'user'
-                    ? 'bg-blue-500 text-white'
-                    : 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white'
-                }`}
-              >
-                {message.text}
-              </div>
-            </div>
-          ))}
-        </div>
-      </aside>
-      <main className="flex-grow flex flex-col items-center justify-center p-4">
-        <DynamicAIIcon isActive={isAISpeaking} />
-        <p className="text-sm text-gray-500 dark:text-gray-400 mt-4 mb-2" aria-live="polite">
-          {status}
-        </p>
-        <button
-          onClick={toggleRecording}
-          className={`w-16 h-16 rounded-full flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 ${
-            isRecording
-              ? 'bg-red-500 hover:bg-red-600'
-              : 'bg-blue-500 hover:bg-blue-600'
-          }`}
-          aria-label={isRecording ? "Stop recording" : "Start recording"}
-        >
-          {isRecording ? (
-            <MicOff className="w-8 h-8 text-white" />
-          ) : (
-            <Mic className="w-8 h-8 text-white" />
-          )}
-        </button>
-      </main>
+      <ChatSidebar messages={messages} />
+      <VoiceControl
+        isRecording={isRecording}
+        isAISpeaking={isAISpeaking}
+        status={status}
+        onToggleRecording={toggleRecording}
+      />
     </div>
   )
 }
