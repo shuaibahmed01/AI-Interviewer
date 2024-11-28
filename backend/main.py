@@ -68,7 +68,7 @@ async def main():
     # Initialize context with single system message
     initial_messages = [{
         "role": "system",
-        "content": "You are an AI interviewer conducting a amazon job interview. Be professional, ask relevant questions, and provide constructive feedback. Keep your responses concise and focused. Because this is for Amazon, you will be interviewing for a business intelligence engineer role. Ask behavioural and technical questions. Make sure to touch on Amazon Leadership Principles."
+        "content": "You are an interviewer conducting a mock interview, first ask the user what role they are interviewing for, then ask them questions relevant to that role. Make sure to ask one question at a time. So ask a question, wait for a response, then ask the next question, like a typical interview."
     }]
     
     context = OpenAILLMContext(initial_messages)
